@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"net/http"
 	"os"
+	"slices"
 	"strings"
 
 	"github.com/MakeNowJust/heredoc"
@@ -23,22 +24,24 @@ const defaultSSHKeyTitle = "GitHub CLI"
 
 type iconfig interface {
 	Login(string, string, string, string, bool) (bool, error)
+	UsersForHost(string) []string
 }
 
 type LoginOptions struct {
-	IO            *iostreams.IOStreams
-	Config        iconfig
-	HTTPClient    *http.Client
-	GitClient     *git.Client
-	Hostname      string
-	Interactive   bool
-	Web           bool
-	Scopes        []string
-	Executable    string
-	GitProtocol   string
-	Prompter      Prompt
-	Browser       browser.Browser
-	SecureStorage bool
+	IO               *iostreams.IOStreams
+	Config           iconfig
+	HTTPClient       *http.Client
+	GitClient        *git.Client
+	Hostname         string
+	Interactive      bool
+	Web              bool
+	Scopes           []string
+	Executable       string
+	GitProtocol      string
+	Prompter         Prompt
+	Browser          browser.Browser
+	SecureStorage    bool
+	SkipSSHKeyPrompt bool
 
 	sshContext ssh.Context
 }
@@ -56,7 +59,7 @@ func Login(opts *LoginOptions) error {
 			"SSH",
 		}
 		result, err := opts.Prompter.Select(
-			"What is your preferred protocol for Git operations?",
+			"What is your preferred protocol for Git operations on this host?",
 			options[0],
 			options)
 		if err != nil {
@@ -82,7 +85,7 @@ func Login(opts *LoginOptions) error {
 
 	var keyToUpload string
 	keyTitle := defaultSSHKeyTitle
-	if opts.Interactive && gitProtocol == "ssh" {
+	if opts.Interactive && !opts.SkipSSHKeyPrompt && gitProtocol == "ssh" {
 		pubKeys, err := opts.sshContext.LocalPublicKeys()
 		if err != nil {
 			return err
@@ -177,11 +180,20 @@ func Login(opts *LoginOptions) error {
 
 	if username == "" {
 		var err error
-		username, err = getCurrentLogin(httpClient, hostname, authToken)
+		username, err = GetCurrentLogin(httpClient, hostname, authToken)
 		if err != nil {
-			return fmt.Errorf("error using api: %w", err)
+			return fmt.Errorf("error retrieving current user: %w", err)
 		}
 	}
+
+	// Get these users before adding the new one, so that we can
+	// check whether the user was already logged in later.
+	//
+	// In this case we ignore the error if the host doesn't exist
+	// because that can occur when the user is logging into a host
+	// for the first time.
+	usersForHost := cfg.UsersForHost(hostname)
+	userWasAlreadyLoggedIn := slices.Contains(usersForHost, username)
 
 	if gitProtocol != "" {
 		fmt.Fprintf(opts.IO.ErrOut, "- gh config set -h %s git_protocol %s\n", hostname, gitProtocol)
@@ -217,6 +229,10 @@ func Login(opts *LoginOptions) error {
 	}
 
 	fmt.Fprintf(opts.IO.ErrOut, "%s Logged in as %s\n", cs.SuccessIcon(), cs.Bold(username))
+	if userWasAlreadyLoggedIn {
+		fmt.Fprintf(opts.IO.ErrOut, "%s You were already logged in to this account\n", cs.WarningIcon())
+	}
+
 	return nil
 }
 
@@ -238,7 +254,7 @@ func sshKeyUpload(httpClient *http.Client, hostname, keyFile string, title strin
 	return add.SSHKeyUpload(httpClient, hostname, f, title)
 }
 
-func getCurrentLogin(httpClient httpClient, hostname, authToken string) (string, error) {
+func GetCurrentLogin(httpClient httpClient, hostname, authToken string) (string, error) {
 	query := `query UserCurrent{viewer{login}}`
 	reqBody, err := json.Marshal(map[string]interface{}{"query": query})
 	if err != nil {
